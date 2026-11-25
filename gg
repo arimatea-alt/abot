@@ -1,0 +1,1118 @@
+--[[
+    Ice Hub - Aimbot + ESP
+    UI      : Rayfield Gen2 (https://sirius.menu/gen2)
+    Drawing : Real's Drawing API (WorldToViewportPoint, no topbar inset)
+    Features: camera-lock aimbot (FOV / smoothing / aim part / wall check / team check)
+              ESP with box, name, health bar + number, distance, tracer, head dot,
+              wall check (visible only) and team check.
+    Re-running this script tears the previous run down first.
+]]
+
+local Players   = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local LP = Players.LocalPlayer
+local BIND_NAME = "IceHub_Render"
+
+--============================================================
+-- Previous run cleanup
+--============================================================
+local old = getgenv().IceHub
+if type(old) == "table" and type(old.destroy) == "function" then
+    pcall(old.destroy)
+end
+
+--============================================================
+-- Rayfield Gen2
+--============================================================
+local okLoad, Rayfield = pcall(function()
+    local chunk = loadstring(game:HttpGet("https://sirius.menu/gen2"))
+    return chunk()
+end)
+if not okLoad or type(Rayfield) ~= "table" then
+    error("[IceHub] Rayfield Gen2 failed to load: " .. tostring(Rayfield))
+end
+
+--============================================================
+-- Config
+--============================================================
+local cfg = {
+    aim = {
+        enabled     = false,
+        requireKey  = true,
+        instant     = true,
+        sticky      = true,
+        nearest     = false,
+        fov         = 120,
+        speed       = 30,
+        part        = "Head",
+        wallCheck   = true,
+        teamCheck   = true,
+        showFov     = true,
+        fovColor    = Color3.fromRGB(255, 255, 255),
+        fovAlpha    = 1,
+    },
+    esp = {
+        enabled        = false,
+        box            = true,
+        name           = true,
+        health         = true,
+        healthGradient = true,
+        distance       = true,
+        tracer         = false,
+        headDot        = true,
+        wallCheck      = false,
+        teamCheck      = true,
+        maxDist        = 800,
+        boxColor       = Color3.fromRGB(255, 255, 255),
+        nameColor      = Color3.fromRGB(255, 255, 255),
+        healthColor    = Color3.fromRGB(0, 255, 120),
+        tracerColor    = Color3.fromRGB(255, 255, 255),
+    },
+}
+
+--============================================================
+-- UI
+--============================================================
+local cycleTarget -- forward declaration, assigned in the aimbot section
+local lockedPlr -- forward declaration, assigned in the aimbot section
+local aimToggleActive = false
+local aimEnabledToggle
+
+local window = Rayfield:CreateWindow({
+    name = "Ice Hub",
+    subtitle = "Aimbot + ESP - Rayfield Gen2",
+    theme = "cobalt",
+    sidebarLayout = true,
+    configuration = {
+        autoSave = true,
+        autoLoad = true,
+        fileName = "IceHub",
+    },
+})
+
+local aimTab = window:CreateTab({ name = "Aimbot" })
+local espTab = window:CreateTab({ name = "ESP" })
+
+local function toggleAimbot()
+    aimToggleActive = not aimToggleActive
+    aimEnabledToggle:Set(aimToggleActive)
+    pcall(function()
+        window:Toast({
+            title = aimToggleActive and "Aimbot ON" or "Aimbot OFF",
+            duration = 2,
+        })
+    end)
+end
+
+--// ---------------- Aimbot ----------------
+aimTab:CreateSection({ name = "Aimbot" })
+
+aimEnabledToggle = aimTab:CreateToggle({
+    name = "Enable Aimbot",
+    description = "Locks the camera onto the closest target inside the FOV.",
+    flag = "aim_enabled",
+    value = false,
+    callback = function(v)
+        cfg.aim.enabled = v
+        if not v then aimToggleActive = false end
+    end,
+})
+
+aimTab:CreateToggle({
+    name = "Require Aim Key",
+    description = "Only aim while the aim key is held (or the aimbot is toggled on).",
+    flag = "aim_requirekey",
+    value = true,
+    callback = function(v) cfg.aim.requireKey = v end,
+})
+
+local aimHeld = false
+local refreshHint -- forward declaration, assigned in the hotkey section
+
+-- Keybind elements only hold the bound key. The InputBegan / InputEnded listeners
+-- further down do the actual work, so hotkeys keep working regardless of how the
+-- UI library routes its own input.
+aimTab:CreateKeybind({
+    name = "Aim Key (hold)",
+    description = "Hold this key to aim.",
+    flag = "aim_key",
+    value = Enum.KeyCode.LeftAlt,
+    callback = function() end,
+    onChanged = function() if refreshHint then refreshHint() end end,
+})
+
+aimTab:CreateKeybind({
+    name = "Toggle Aimbot",
+    description = "Press once to switch the whole aimbot on or off.",
+    flag = "aim_togglebind",
+    value = Enum.KeyCode.Insert,
+    callback = function() end,
+    onChanged = function() if refreshHint then refreshHint() end end,
+})
+
+aimTab:CreateKeybind({
+    name = "Next Target",
+    description = "Cycle the locked target forward.",
+    flag = "aim_nexttarget",
+    value = Enum.KeyCode.RightBracket,
+    callback = function() end,
+    onChanged = function() if refreshHint then refreshHint() end end,
+})
+
+aimTab:CreateKeybind({
+    name = "Previous Target",
+    description = "Cycle the locked target backward.",
+    flag = "aim_prevtarget",
+    value = Enum.KeyCode.LeftBracket,
+    callback = function() end,
+    onChanged = function() if refreshHint then refreshHint() end end,
+})
+
+--// ---------------- Hotkeys ----------------
+local UserInputService = game:GetService("UserInputService")
+
+local hotkeyDefaults = {
+    aim_key = Enum.KeyCode.LeftAlt,
+    aim_togglebind = Enum.KeyCode.Insert,
+    aim_nexttarget = Enum.KeyCode.RightBracket,
+    aim_prevtarget = Enum.KeyCode.LeftBracket,
+}
+
+local function boundKey(flag)
+    local ok, v = pcall(function() return window:Get(flag) end)
+    if ok and typeof(v) == "EnumItem" and v.EnumType == Enum.KeyCode then
+        return v
+    end
+    return hotkeyDefaults[flag]
+end
+
+local hotkeyConns = {}
+
+table.insert(hotkeyConns, UserInputService.InputBegan:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    -- Ignore keys while the player is typing (chat, search boxes).
+    if UserInputService:GetFocusedTextBox() then return end
+
+    local k = input.KeyCode
+    if k == boundKey("aim_key") then
+        aimHeld = true
+    elseif k == boundKey("aim_togglebind") then
+        toggleAimbot()
+    elseif k == boundKey("aim_nexttarget") then
+        cycleTarget(1)
+    elseif k == boundKey("aim_prevtarget") then
+        cycleTarget(-1)
+    end
+end))
+
+table.insert(hotkeyConns, UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    if input.KeyCode == boundKey("aim_key") then
+        aimHeld = false
+    end
+end))
+
+table.insert(hotkeyConns, UserInputService.WindowFocusReleased:Connect(function()
+    -- Releasing the window mid-hold would otherwise leave the aim key stuck down.
+    aimHeld = false
+end))
+
+-- Keep the on-screen hint in sync with whatever the player binds.
+local hintText
+
+local PRETTY_KEYS = {
+    RightBracket = "]",
+    LeftBracket = "[",
+    LeftAlt = "Alt",
+    RightAlt = "AltGr",
+    LeftShift = "Shift",
+    RightShift = "Shift",
+    LeftControl = "Ctrl",
+    RightControl = "Ctrl",
+    LeftMeta = "Win",
+    RightMeta = "Win",
+}
+
+local function keyLabel(flag)
+    local ok, v = pcall(function() return window:Get(flag) end)
+    if not (ok and typeof(v) == "EnumItem") then
+        v = hotkeyDefaults[flag]
+    end
+    return PRETTY_KEYS[v.Name] or v.Name
+end
+
+refreshHint = function()
+    local line = string.format(
+        "Toggle %s  |  Hold %s  |  Next %s  |  Prev %s",
+        keyLabel("aim_togglebind"), keyLabel("aim_key"), keyLabel("aim_nexttarget"), keyLabel("aim_prevtarget")
+    )
+    if hintText then
+        pcall(function() hintText:Set(line) end)
+    end
+end
+
+aimTab:CreateToggle({
+    name = "Instant Snap",
+    description = "Pins the camera straight onto the head every frame, no glide.",
+    flag = "aim_instant",
+    value = true,
+    callback = function(v) cfg.aim.instant = v end,
+})
+
+aimTab:CreateToggle({
+    name = "Sticky Target",
+    description = "Keeps the same target locked until it dies or breaks line of sight.",
+    flag = "aim_sticky",
+    value = true,
+    callback = function(v) cfg.aim.sticky = v end,
+})
+
+aimTab:CreateToggle({
+    name = "Nearest Target",
+    description = "Lock the player who is physically closest instead of the one closest to your crosshair. Turn Sticky off if you want it to keep re-picking whoever gets closest.",
+    flag = "aim_nearest",
+    value = false,
+    callback = function(v)
+        cfg.aim.nearest = v
+        lockedPlr = nil
+        pcall(function()
+            window:Toast({
+                title = v and "Targeting: nearest player" or "Targeting: closest to crosshair",
+                duration = 2,
+            })
+        end)
+    end,
+})
+
+aimTab:CreateSlider({
+    name = "FOV",
+    description = "Aim cone in degrees.",
+    flag = "aim_fov",
+    range = { 5, 360 },
+    increment = 1,
+    value = 120,
+    suffix = " deg",
+    callback = function(v) cfg.aim.fov = v end,
+})
+
+aimTab:CreateSlider({
+    name = "Aim Speed",
+    description = "Only used when Instant Snap is off. Higher snaps faster.",
+    flag = "aim_speed",
+    range = { 1, 100 },
+    increment = 1,
+    value = 30,
+    callback = function(v) cfg.aim.speed = v end,
+})
+
+aimTab:CreateDropdown({
+    name = "Aim Part",
+    flag = "aim_part",
+    options = { "Head", "UpperTorso", "HumanoidRootPart" },
+    value = "Head",
+    callback = function(v) cfg.aim.part = v end,
+})
+
+aimTab:CreateToggle({
+    name = "Wall Check",
+    description = "Skip targets that are behind cover.",
+    flag = "aim_wallcheck",
+    value = true,
+    callback = function(v) cfg.aim.wallCheck = v end,
+})
+
+aimTab:CreateToggle({
+    name = "Team Check",
+    description = "Skip players on your own team.",
+    flag = "aim_teamcheck",
+    value = true,
+    callback = function(v) cfg.aim.teamCheck = v end,
+})
+
+aimTab:CreateToggle({
+    name = "Show FOV Circle",
+    description = "Ring showing the aim cone. Stays visible even while the aimbot is off, so you can tune the FOV slider.",
+    flag = "aim_showfov",
+    value = true,
+    callback = function(v) cfg.aim.showFov = v end,
+})
+
+aimTab:CreateColorPicker({
+    name = "FOV Circle Color",
+    flag = "aim_fovcolor",
+    color = Color3.fromRGB(255, 255, 255),
+    callback = function(color, alpha)
+        cfg.aim.fovColor = color
+        cfg.aim.fovAlpha = alpha or 1
+    end,
+})
+
+local statusText = aimTab:CreateText({
+    name = "Status",
+    text = "Idle",
+})
+
+hintText = aimTab:CreateText({
+    name = "Hotkeys",
+    text = "Toggle Insert  |  Hold LeftAlt  |  Next ]  |  Prev [",
+})
+
+refreshHint()
+
+aimTab:CreateButton({
+    name = "Unload Script",
+    callback = function()
+        local api = getgenv().IceHub
+        if api and api.destroy then api.destroy() end
+    end,
+})
+
+--// ---------------- ESP ----------------
+espTab:CreateSection({ name = "ESP" })
+
+espTab:CreateToggle({
+    name = "Enable ESP",
+    flag = "esp_enabled",
+    value = false,
+    callback = function(v) cfg.esp.enabled = v end,
+})
+
+espTab:CreateToggle({
+    name = "Box",
+    flag = "esp_box",
+    value = true,
+    callback = function(v) cfg.esp.box = v end,
+})
+
+espTab:CreateToggle({
+    name = "Name",
+    flag = "esp_name",
+    value = true,
+    callback = function(v) cfg.esp.name = v end,
+})
+
+espTab:CreateToggle({
+    name = "Health Bar + Number",
+    flag = "esp_health",
+    value = true,
+    callback = function(v) cfg.esp.health = v end,
+})
+
+espTab:CreateToggle({
+    name = "Health Gradient",
+    description = "Tint the health bar red to green instead of one colour.",
+    flag = "esp_healthgrad",
+    value = true,
+    callback = function(v) cfg.esp.healthGradient = v end,
+})
+
+espTab:CreateToggle({
+    name = "Distance",
+    flag = "esp_distance",
+    value = true,
+    callback = function(v) cfg.esp.distance = v end,
+})
+
+espTab:CreateToggle({
+    name = "Tracer",
+    flag = "esp_tracer",
+    value = false,
+    callback = function(v) cfg.esp.tracer = v end,
+})
+
+espTab:CreateToggle({
+    name = "Head Dot",
+    flag = "esp_headdot",
+    value = true,
+    callback = function(v) cfg.esp.headDot = v end,
+})
+
+espTab:CreateToggle({
+    name = "Wall Check (visible only)",
+    description = "Hide players that are behind cover.",
+    flag = "esp_wallcheck",
+    value = false,
+    callback = function(v) cfg.esp.wallCheck = v end,
+})
+
+espTab:CreateToggle({
+    name = "Team Check",
+    flag = "esp_teamcheck",
+    value = true,
+    callback = function(v) cfg.esp.teamCheck = v end,
+})
+
+espTab:CreateSlider({
+    name = "Max Distance",
+    flag = "esp_maxdist",
+    range = { 25, 2000 },
+    increment = 25,
+    value = 800,
+    suffix = "m",
+    callback = function(v) cfg.esp.maxDist = v end,
+})
+
+espTab:CreateColorPicker({
+    name = "Box Color",
+    flag = "esp_boxcolor",
+    color = Color3.fromRGB(255, 255, 255),
+    callback = function(color) cfg.esp.boxColor = color end,
+})
+
+espTab:CreateColorPicker({
+    name = "Name / Distance Color",
+    flag = "esp_namecolor",
+    color = Color3.fromRGB(255, 255, 255),
+    callback = function(color) cfg.esp.nameColor = color end,
+})
+
+espTab:CreateColorPicker({
+    name = "Health Color",
+    flag = "esp_healthcolor",
+    color = Color3.fromRGB(0, 255, 120),
+    callback = function(color) cfg.esp.healthColor = color end,
+})
+
+espTab:CreateColorPicker({
+    name = "Tracer Color",
+    flag = "esp_tracercolor",
+    color = Color3.fromRGB(255, 255, 255),
+    callback = function(color) cfg.esp.tracerColor = color end,
+})
+
+--============================================================
+-- Drawing helpers
+--============================================================
+local drawings = {}
+local function newDrawing(class)
+    local d = Drawing.new(class)
+    d.Visible = false
+    drawings[#drawings + 1] = d
+    return d
+end
+
+local fovCircle = newDrawing("Circle")
+fovCircle.Thickness = 1
+fovCircle.Filled = false
+
+local espObjs = {}
+local visCache = {}
+local extentsCache = {}
+
+local function objSet(plr)
+    local o = espObjs[plr]
+    if o then return o end
+
+    o = {
+        box    = newDrawing("Square"),
+        hpBg   = newDrawing("Square"),
+        hpFill = newDrawing("Square"),
+        name   = newDrawing("Text"),
+        hpText = newDrawing("Text"),
+        dist   = newDrawing("Text"),
+        tracer = newDrawing("Line"),
+        dot    = newDrawing("Circle"),
+    }
+
+    o.box.Thickness = 1
+    o.box.Filled = false
+
+    o.hpBg.Filled = true
+    o.hpBg.Color = Color3.new(0, 0, 0)
+    o.hpBg.Transparency = 0.45
+
+    o.hpFill.Filled = true
+    o.hpFill.Transparency = 0
+
+    for _, t in ipairs({ o.name, o.hpText, o.dist }) do
+        t.Center = true
+        t.Outline = true
+        t.OutlineColor = Color3.new(0, 0, 0)
+        t.Font = Drawing.Fonts.Plex
+    end
+    o.name.Size = 14
+    o.hpText.Size = 12
+    o.dist.Size = 12
+
+    o.tracer.Thickness = 1
+    o.dot.Filled = true
+    o.dot.Thickness = 1
+
+    espObjs[plr] = o
+    return o
+end
+
+local function hideAll(o)
+    for _, d in pairs(o) do
+        d.Visible = false
+    end
+end
+
+local function removePlayer(plr)
+    local o = espObjs[plr]
+    if o then
+        for _, d in pairs(o) do
+            pcall(function() d:Remove() end)
+        end
+        espObjs[plr] = nil
+    end
+    visCache[plr] = nil
+end
+
+--============================================================
+-- Player helpers
+--============================================================
+local BODY_PARTS = {
+    Head = true, HumanoidRootPart = true,
+    UpperTorso = true, LowerTorso = true, Torso = true,
+    LeftUpperArm = true, LeftLowerArm = true, LeftHand = true,
+    RightUpperArm = true, RightLowerArm = true, RightHand = true,
+    LeftUpperLeg = true, LeftLowerLeg = true, LeftFoot = true,
+    RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
+    ["Left Arm"] = true, ["Right Arm"] = true,
+    ["Left Leg"] = true, ["Right Leg"] = true,
+}
+
+local function charExtents(char)
+    local cached = extentsCache[char]
+    local now = os.clock()
+    if cached and now - cached.t < 0.5 then
+        return cached.top, cached.bottom
+    end
+
+    local top, bottom = -math.huge, math.huge
+    for _, p in ipairs(char:GetChildren()) do
+        if p:IsA("BasePart") and BODY_PARTS[p.Name] then
+            local y = p.Position.Y
+            local half = p.Size.Y / 2
+            top = math.max(top, y + half)
+            bottom = math.min(bottom, y - half)
+        end
+    end
+
+    if top == -math.huge then
+        local head = char:FindFirstChild("Head")
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if not head or not hrp then return nil end
+        top = head.Position.Y + head.Size.Y / 2
+        bottom = hrp.Position.Y - 2.8
+    end
+
+    extentsCache[char] = { t = now, top = top, bottom = bottom }
+    return top, bottom
+end
+
+local function sameTeam(plr)
+    local a, b = LP.Team, plr.Team
+    if a and b then
+        return a == b
+    end
+    return false
+end
+
+local function getAimPart(char)
+    local part = char:FindFirstChild(cfg.aim.part)
+    if part and part:IsA("BasePart") then
+        return part
+    end
+    part = char:FindFirstChild("Head")
+        or char:FindFirstChild("UpperTorso")
+        or char:FindFirstChild("HumanoidRootPart")
+    if part and part:IsA("BasePart") then
+        return part
+    end
+    return nil
+end
+
+--============================================================
+-- Wall check
+--============================================================
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+
+local function isVisible(plr)
+    local char = plr.Character
+    local myChar = LP.Character
+    local cam = Workspace.CurrentCamera
+    if not char or not myChar or not cam then return false end
+
+    local part = getAimPart(char)
+    if not part then return false end
+
+    local origin = cam.CFrame.Position
+    local delta = part.Position - origin
+    if delta.Magnitude < 1 then return true end
+
+    rayParams.FilterDescendantsInstances = { char, myChar }
+    local hit = Workspace:Raycast(origin, delta, rayParams)
+    return hit == nil
+end
+
+local function visibleCached(plr)
+    local e = visCache[plr]
+    local now = os.clock()
+    if e and now - e.t < 0.1 then
+        return e.v
+    end
+    local v = isVisible(plr)
+    visCache[plr] = { t = now, v = v }
+    return v
+end
+
+--============================================================
+-- Health colour
+--============================================================
+local function healthColor(pct)
+    local red    = Color3.fromRGB(235, 55, 55)
+    local yellow = Color3.fromRGB(240, 190, 50)
+    local green  = Color3.fromRGB(60, 230, 110)
+    if pct >= 0.5 then
+        return yellow:Lerp(green, (pct - 0.5) * 2)
+    end
+    return red:Lerp(yellow, pct * 2)
+end
+
+--============================================================
+-- Aimbot
+--============================================================
+lockedPlr = nil
+
+-- Returns the aim position for one player, or nil if they are not a valid target.
+local function targetPosFor(plr)
+    local char = plr.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not char or not hum or hum.Health <= 0 then return nil end
+    if cfg.aim.teamCheck and sameTeam(plr) then return nil end
+
+    local part = getAimPart(char)
+    if not part then return nil end
+    if cfg.aim.wallCheck and not visibleCached(plr) then return nil end
+
+    return part.Position
+end
+
+-- Every valid target, closest to the crosshair first.
+-- ignoreFov = true keeps the list stable while the camera snaps between targets.
+local function collectTargets(cam, ignoreFov)
+    local list = {}
+    local camPos = cam.CFrame.Position
+    local look = cam.CFrame.LookVector
+    local halfFov = cfg.aim.fov / 2
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP then
+            local char = plr.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if char and hum and hum.Health > 0 then
+                local part = getAimPart(char)
+                if part then
+                    local delta = part.Position - camPos
+                    local dist = delta.Magnitude
+                    if dist > 1 then
+                        local angle = math.deg(math.acos(math.clamp(look:Dot(delta.Unit), -1, 1)))
+                        if ignoreFov or angle <= halfFov then
+                            local skip = false
+                            if cfg.aim.teamCheck and sameTeam(plr) then
+                                skip = true
+                            elseif cfg.aim.wallCheck and not visibleCached(plr) then
+                                skip = true
+                            end
+                            if not skip then
+                                table.insert(list, { plr = plr, pos = part.Position, angle = angle, dist = dist })
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(list, function(a, b)
+        return a.angle < b.angle
+    end)
+
+    return list
+end
+
+-- Cycle the locked target. dir = 1 forward, -1 backward.
+-- Sorted by distance so the order does not jump when the camera snaps to a new head.
+function cycleTarget(dir)
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+
+    local list = collectTargets(cam, true)
+    if #list == 0 then
+        lockedPlr = nil
+        pcall(function()
+            window:Toast({ title = "No targets available", duration = 2 })
+        end)
+        return
+    end
+
+    table.sort(list, function(a, b)
+        return a.dist < b.dist
+    end)
+
+    local idx = nil
+    for i, t in ipairs(list) do
+        if t.plr == lockedPlr then
+            idx = i
+            break
+        end
+    end
+
+    if idx then
+        idx = ((idx - 1 + dir) % #list) + 1
+    else
+        idx = dir > 0 and 1 or #list
+    end
+
+    lockedPlr = list[idx].plr
+    pcall(function()
+        window:Toast({ title = "Target: " .. lockedPlr.DisplayName, duration = 2 })
+    end)
+end
+
+local function findTarget(cam)
+    -- Sticky lock: stay on the current target while it is still valid.
+    if cfg.aim.sticky and lockedPlr then
+        local pos = targetPosFor(lockedPlr)
+        if pos then
+            return pos, lockedPlr
+        end
+        lockedPlr = nil
+    end
+
+    local list = collectTargets(cam)
+    local pick = list[1]
+    if pick and cfg.aim.nearest then
+        for _, t in ipairs(list) do
+            if t.dist < pick.dist then
+                pick = t
+            end
+        end
+    end
+
+    if pick then
+        lockedPlr = pick.plr
+        return pick.pos, pick.plr
+    end
+
+    lockedPlr = nil
+    return nil, nil
+end
+
+--============================================================
+-- ESP
+--============================================================
+local function drawESP(cam)
+    local vp = cam.ViewportSize
+    local camPos = cam.CFrame.Position
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local o = espObjs[plr]
+        local char = plr.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local head = char and char:FindFirstChild("Head")
+
+        local show = cfg.esp.enabled
+            and plr ~= LP
+            and char ~= nil
+            and hum ~= nil
+            and hrp ~= nil
+            and head ~= nil
+            and hum.Health > 0
+
+        local dist = 0
+        if show then
+            dist = (hrp.Position - camPos).Magnitude
+            if dist > cfg.esp.maxDist then show = false end
+        end
+        if show and cfg.esp.teamCheck and sameTeam(plr) then show = false end
+        if show and cfg.esp.wallCheck and not visibleCached(plr) then show = false end
+
+        if not show then
+            if o then hideAll(o) end
+            continue
+        end
+
+        o = objSet(plr)
+
+        local top, bottom = charExtents(char)
+        if not top then
+            hideAll(o)
+            continue
+        end
+
+        local topScreen, topOn = cam:WorldToViewportPoint(Vector3.new(hrp.Position.X, top, hrp.Position.Z))
+        local botScreen, botOn = cam:WorldToViewportPoint(Vector3.new(hrp.Position.X, bottom, hrp.Position.Z))
+
+        if not topOn or not botOn then
+            hideAll(o)
+            continue
+        end
+
+        local h = math.abs(botScreen.Y - topScreen.Y)
+        if h < 5 then
+            hideAll(o)
+            continue
+        end
+
+        local w = h * 0.55
+        local x = topScreen.X - w / 2
+        local y = topScreen.Y
+
+        if x + w < 0 or x > vp.X or y + h < 0 or y > vp.Y then
+            hideAll(o)
+            continue
+        end
+
+        -- Box
+        o.box.Position = Vector2.new(x, y)
+        o.box.Size = Vector2.new(w, h)
+        o.box.Color = cfg.esp.boxColor
+        o.box.Visible = cfg.esp.box
+
+        -- Health bar + number
+        local maxHealth = math.max(hum.MaxHealth, 1)
+        local pct = math.clamp(hum.Health / maxHealth, 0, 1)
+        local col = cfg.esp.healthGradient and healthColor(pct) or cfg.esp.healthColor
+        local barW = 2
+        local bx = x - 5
+
+        o.hpBg.Position = Vector2.new(bx, y)
+        o.hpBg.Size = Vector2.new(barW, h)
+        o.hpBg.Visible = cfg.esp.health
+
+        o.hpFill.Position = Vector2.new(bx, y + h * (1 - pct))
+        o.hpFill.Size = Vector2.new(barW, math.max(h * pct, 1))
+        o.hpFill.Color = col
+        o.hpFill.Visible = cfg.esp.health
+
+        o.hpText.Text = tostring(math.ceil(hum.Health))
+        o.hpText.Position = Vector2.new(bx - 14, y + h / 2)
+        o.hpText.Color = col
+        o.hpText.Visible = cfg.esp.health
+
+        -- Name
+        o.name.Text = plr.DisplayName
+        o.name.Position = Vector2.new(x + w / 2, y - 14)
+        o.name.Color = cfg.esp.nameColor
+        o.name.Visible = cfg.esp.name
+
+        -- Distance
+        o.dist.Text = string.format("%dm", math.floor(dist))
+        o.dist.Position = Vector2.new(x + w / 2, y + h + 8)
+        o.dist.Color = cfg.esp.nameColor
+        o.dist.Visible = cfg.esp.distance
+
+        -- Tracer
+        o.tracer.From = Vector2.new(vp.X / 2, vp.Y)
+        o.tracer.To = Vector2.new(x + w / 2, y + h)
+        o.tracer.Color = cfg.esp.tracerColor
+        o.tracer.Visible = cfg.esp.tracer
+
+        -- Head dot
+        local headScreen, headOn = cam:WorldToViewportPoint(head.Position)
+        if headOn then
+            o.dot.Position = Vector2.new(headScreen.X, headScreen.Y)
+            o.dot.Radius = math.max(2, h * 0.035)
+            o.dot.Color = cfg.esp.boxColor
+            o.dot.Visible = cfg.esp.headDot
+        else
+            o.dot.Visible = false
+        end
+    end
+end
+
+--============================================================
+-- Render loop
+--============================================================
+local lastName = nil
+local function setStatus(text)
+    if text ~= lastName then
+        lastName = text
+        statusText:Set(text)
+    end
+end
+
+RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 1, function(dt)
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+
+    -- Aimbot
+    if cfg.aim.enabled and (aimHeld or aimToggleActive or not cfg.aim.requireKey) then
+        local targetPos, targetPlr = findTarget(cam)
+        if targetPos then
+            local goal = CFrame.lookAt(cam.CFrame.Position, targetPos)
+            if cfg.aim.instant then
+                cam.CFrame = goal
+            else
+                local alpha = 1 - math.exp(-cfg.aim.speed * dt)
+                cam.CFrame = cam.CFrame:Lerp(goal, alpha)
+            end
+            setStatus((cfg.aim.nearest and "Nearest: " or "Locked: ") .. (targetPlr and targetPlr.DisplayName or "?"))
+        else
+            setStatus("No target")
+        end
+    elseif cfg.aim.enabled then
+        setStatus("Hold aim key")
+    else
+        setStatus("Idle")
+    end
+
+    -- FOV circle. Drawn whenever the toggle is on, not only while the aimbot is
+    -- running, so the slider has a visible preview.
+    if cfg.aim.showFov then
+        local vp = cam.ViewportSize
+        local halfFov = math.rad(math.clamp(cfg.aim.fov, 1, 179) / 2)
+        local halfCam = math.rad(math.clamp(cam.FieldOfView, 1, 179) / 2)
+        local radius = 0
+        if halfCam > 0.001 then
+            radius = (math.tan(halfFov) / math.tan(halfCam)) * (vp.Y / 2)
+        end
+        -- A very wide FOV puts the ring beyond the screen edge, where it would be
+        -- invisible. Pull it back to just inside the corners so there is always
+        -- something to look at.
+        local corner = math.sqrt((vp.X / 2) ^ 2 + (vp.Y / 2) ^ 2) * 0.98
+        fovCircle.Position = Vector2.new(vp.X / 2, vp.Y / 2)
+        fovCircle.Radius = math.clamp(radius, 1, corner)
+        fovCircle.Color = cfg.aim.fovColor
+        fovCircle.Transparency = 1 - math.clamp(cfg.aim.fovAlpha or 1, 0, 1)
+        fovCircle.Thickness = 1
+        fovCircle.Visible = true
+    else
+        fovCircle.Visible = false
+    end
+
+    -- ESP
+    drawESP(cam)
+end)
+
+--============================================================
+-- Player lifecycle
+--============================================================
+local connections = {}
+table.insert(connections, Players.PlayerRemoving:Connect(removePlayer))
+
+local function onCharacterAdded(char)
+    extentsCache[char] = nil
+end
+
+local function watchPlayer(plr)
+    if plr.Character then onCharacterAdded(plr.Character) end
+    table.insert(connections, plr.CharacterAdded:Connect(onCharacterAdded))
+end
+
+for _, plr in ipairs(Players:GetPlayers()) do
+    watchPlayer(plr)
+end
+table.insert(connections, Players.PlayerAdded:Connect(watchPlayer))
+
+--============================================================
+-- Cleanup
+--============================================================
+local api = {}
+local destroyed = false
+
+function api.set(flag, value)
+    local ok = pcall(function() window:Set(flag, value) end)
+    return ok
+end
+
+function api.get(flag)
+    local ok, v = pcall(function() return window:Get(flag) end)
+    if ok then return v end
+    return nil
+end
+
+function api.toggleAimbot()
+    toggleAimbot()
+end
+
+function api.cycle(dir)
+    cycleTarget(dir or 1)
+end
+
+function api.debug()
+    local out = { viewport = tostring(Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize) }
+    out.locked = lockedPlr and lockedPlr.Name or nil
+    out.aimHeld = aimHeld
+    out.toggled = aimToggleActive
+    out.nearest = cfg.aim.nearest
+    out.sticky = cfg.aim.sticky
+    out.showFov = cfg.aim.showFov
+    out.fovValue = cfg.aim.fov
+    out.fovCircle = {
+        visible = fovCircle.Visible,
+        radius = fovCircle.Radius,
+        x = fovCircle.Position.X,
+        y = fovCircle.Position.Y,
+        thickness = fovCircle.Thickness,
+        transparency = fovCircle.Transparency,
+    }
+    local cam = Workspace.CurrentCamera
+    if cam then
+        local names = {}
+        for _, t in ipairs(collectTargets(cam)) do
+            table.insert(names, string.format("%s:%.1f", t.plr.Name, t.angle))
+        end
+        out.targets = table.concat(names, ", ")
+    end
+    local players = {}
+    for plr, o in pairs(espObjs) do
+        players[plr.Name] = {
+            boxVisible = o.box.Visible,
+            box = o.box.Visible and string.format("%.1f,%.1f %.1fx%.1f", o.box.Position.X, o.box.Position.Y, o.box.Size.X, o.box.Size.Y) or nil,
+            name = o.name.Visible and o.name.Text or nil,
+            hp = o.hpText.Visible and o.hpText.Text or nil,
+            dist = o.dist.Visible and o.dist.Text or nil,
+            dot = o.dot.Visible,
+            tracer = o.tracer.Visible,
+        }
+    end
+    out.players = players
+    return out
+end
+
+function api.destroy()
+    if destroyed then return end
+    destroyed = true
+
+    pcall(function() RunService:UnbindFromRenderStep(BIND_NAME) end)
+    for _, c in ipairs(connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    connections = {}
+
+    for _, c in ipairs(hotkeyConns) do
+        pcall(function() c:Disconnect() end)
+    end
+    hotkeyConns = {}
+
+    for _, d in ipairs(drawings) do
+        pcall(function() d:Remove() end)
+    end
+    drawings = {}
+    espObjs = {}
+
+    pcall(function() window:Unload() end)
+
+    if getgenv().IceHub == api then
+        getgenv().IceHub = nil
+    end
+end
+
+getgenv().IceHub = api
+
+window:Notify({
+    title = "Ice Hub loaded",
+    content = "Insert = toggle aimbot, hold Alt = aim, [ / ] = change target.",
+    duration = 5,
+})
+
+print("[IceHub] loaded")
